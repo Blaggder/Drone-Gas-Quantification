@@ -28,10 +28,7 @@ st.set_page_config(
 # STEG 1: SIDOPANEL – GASTRAQ VINDMODELLSINSTÄLLNINGAR
 # ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image(
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png",
-        width=0,  # dold platshållare, logotyp kan bytas ut
-    )
+   
     st.title("⚙️ GASTRAQ-inställningar")
     st.markdown("**Vindmodell (log-lag profil)**")
 
