@@ -28,7 +28,7 @@ st.set_page_config(
 # STEG 1: SIDOPANEL – GASTRAQ VINDMODELLSINSTÄLLNINGAR
 # ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-   
+    
     st.title("⚙️ GASTRAQ-inställningar")
     st.markdown("**Vindmodell (log-lag profil)**")
 
@@ -61,6 +61,18 @@ with st.sidebar:
         step=0.01,
         help="Hellman-exponenten: 0.10 = hav, 0.15 = öppen mark, 0.25 = förort.",
     )
+    
+    st.markdown("**Brusfilter**")
+    
+    # NYTT: Bakgrundsavdrag för 40Hz-sensorn
+    bg_deduction = st.number_input(
+        label="Bakgrundsavdrag (ppm*m)",
+        min_value=0.0,
+        max_value=1000.0,
+        value=150.0,
+        step=10.0,
+        help="Dras av från all gasdata för att få bort sensorns naturliga brus och den globala bakgrunden.",
+    )
 
     st.divider()
     st.caption(
@@ -88,7 +100,7 @@ uploaded_file = st.file_uploader(
 # ──────────────────────────────────────────────────────────────────────────────
 # HJÄLPFUNKTION: Databearbetningsmotor
 # ──────────────────────────────────────────────────────────────────────────────
-def bearbeta_data(fil, v_ref: float, z_ref: float, alpha: float):
+def bearbeta_data(fil, v_ref: float, z_ref: float, alpha: float, bg_deduction: float):
     """
     Läser, rensar och bearbetar en UgCS Skyhub-loggfil.
 
@@ -122,8 +134,8 @@ def bearbeta_data(fil, v_ref: float, z_ref: float, alpha: float):
         raise ValueError("Kolumnen 'ALT:Altitude' saknas i loggfilen.")
 
     # ── 3.3 Smart kolumnväljare för gaskoncentration ───────────────────────
-    # Sensorn har bytt exportformat; testa i prioriteringsordning
-    gas_prioritet = ["GAS:Fast Concentration", "GAS:Leak Concentration", "GAS:Methane"]
+    # NYTT: Prioriterar Filtrerad/Leak-data före Fast-data för att undvika falska 40Hz-spikar
+    gas_prioritet = ["GAS:Leak Concentration", "GAS:Filtered Concentration", "GAS:Methane", "GAS:Fast Concentration"]
     gas_kol = None
     for kandidat in gas_prioritet:
         if kandidat in df.columns:
@@ -139,35 +151,28 @@ def bearbeta_data(fil, v_ref: float, z_ref: float, alpha: float):
     df["Gas_Raw"] = pd.to_numeric(df[gas_kol], errors="coerce")
 
     # ── 3.4 Tidsinterpolering (40 Hz → inga luckor) ───────────────────────
-    # Linjär interpolering binder ihop mätpunkter från sensorer som
-    # loggar på olika tidsstämplar (typiskt problemet med UgCS Skyhub)
     df["Gas_Interpolated"] = df["Gas_Raw"].interpolate(method="linear")
 
     # Ta bort rader som ändå saknar gas, lat eller lon
     df = df.dropna(subset=["Gas_Interpolated", "Lat", "Lon"])
 
-    # ── 3.5 Dynamiskt brusfilter (höjdbaserat) ────────────────────────────
-    # Bakgrundsnivån ökar med höjden (sensorfel & atmosfärisk bakgrund).
-    # Allt under gränsen klassas som bakgrundsbrus.
-    df["Background_Limit"] = df["ALT:Altitude"] * 18.0
-    df_hotspots = df[df["Gas_Interpolated"] > df["Background_Limit"]].copy()
+    # ── 3.5 & 3.6 Dynamiskt brusfilter och Nettogas ───────────────────────
+    # NYTT: Subtrahera bakgrundsavdraget (t.ex. 150 ppm*m) som kunden ställer in
+    df["Net_Gas_ppmm"] = df["Gas_Interpolated"] - bg_deduction
+    
+    # Sätt alla negativa värden till 0 (allt under bakgrundsbruset ignoreras)
+    df.loc[df["Net_Gas_ppmm"] < 0, "Net_Gas_ppmm"] = 0
+    
+    # Behåll BARA de rader som faktiskt har ett utsläpp över noll
+    df_hotspots = df[df["Net_Gas_ppmm"] > 0].copy()
 
     if df_hotspots.empty:
         raise ValueError(
-            "Inga hotspots detekterades efter brusfiltrering. "
-            "Pröva att sänka bakgrundsfaktorn (18.0) eller kontrollera filen."
+            f"Inga hotspots detekterades efter bakgrundsavdraget på {bg_deduction} ppm*m. "
+            "Filen kan visa på en läckagefri flygning, eller så behöver avdraget sänkas."
         )
 
-    # ── 3.6 Nettogas (ppm·m, rensat från höjdberoende bakgrund) ──────────
-    df_hotspots["Net_Gas_ppmm"] = (
-        df_hotspots["Gas_Interpolated"] - (df_hotspots["ALT:Altitude"] * 2.0)
-    )
-    # Negativa värden sätts till 0 (kan uppstå vid extremt låga koncentrationer)
-    df_hotspots["Net_Gas_ppmm"] = df_hotspots["Net_Gas_ppmm"].clip(lower=0)
-
     # ── 3.7 Spatialt rutnät (1×1 m approximation via 5 decimaler) ────────
-    # 0.00001° lat ≈ 1.11 m; 0.00001° lon ≈ 0.64–1.11 m beroende på latitud.
-    # Tillräckligt för att skapa meningsfulla 1×1 m-rutor i fältmiljö.
     df_hotspots["latitude"] = df_hotspots["Lat"].round(5)
     df_hotspots["longitude"] = df_hotspots["Lon"].round(5)
 
@@ -210,8 +215,9 @@ def bearbeta_data(fil, v_ref: float, z_ref: float, alpha: float):
 if uploaded_file is not None:
     with st.spinner("⏳ Bearbetar loggdata – interpolerar sensorer och beräknar flöden…"):
         try:
+            # NYTT: Lägg till bg_deduction i funktionsanropet
             antal_radpunkter, grid_df, gas_kol = bearbeta_data(
-                uploaded_file, v_ref, z_ref, alpha
+                uploaded_file, v_ref, z_ref, alpha, bg_deduction
             )
         except ValueError as e:
             st.error(f"❌ Fel vid bearbetning: {e}")
@@ -254,7 +260,6 @@ if uploaded_file is not None:
         "Zoomfunktion och panorering stöds i kartan."
     )
 
-    # st.map kräver kolumnerna 'latitude' och 'longitude'
     st.map(grid_df[["latitude", "longitude"]], zoom=17, use_container_width=True)
 
     st.divider()
@@ -263,7 +268,6 @@ if uploaded_file is not None:
     st.subheader("📋 Topplista – Värsta 1×1 m-rutorna")
     st.caption("Sorterat efter beräknat massflöde (g/h), fallande.")
 
-    # Välj och formatera de kolumner som är relevanta för fältoperatören
     visnings_df = grid_df[
         [
             "latitude",
@@ -276,7 +280,6 @@ if uploaded_file is not None:
         ]
     ].copy()
 
-    # Avrundning för läsbarhet
     visnings_df = visnings_df.round(
         {
             "latitude": 5,
@@ -288,7 +291,6 @@ if uploaded_file is not None:
         }
     )
 
-    # Byt till svenska kolumnrubriker
     visnings_df.columns = [
         "Latitud",
         "Longitud",
@@ -305,7 +307,6 @@ if uploaded_file is not None:
         height=420,
     )
 
-    # Möjlighet att ladda ner resultatet som CSV
     csv_export = grid_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="⬇️ Ladda ner rutnät som CSV",
@@ -315,17 +316,15 @@ if uploaded_file is not None:
     )
 
 else:
-    # Välkomstmeddelande när ingen fil laddats upp
     st.info(
         "👆 Ladda upp en UgCS Skyhub-loggfil i CSV-format för att starta analysen.\n\n"
         "**Förväntade kolumner:**\n"
         "- `Latitude RTK` / `Longitude RTK` (eller `Latitude` / `Longitude`)\n"
         "- `ALT:Altitude`\n"
-        "- `GAS:Fast Concentration` (eller `GAS:Leak Concentration` / `GAS:Methane`)",
+        "- `GAS:Leak Concentration` (eller `GAS:Filtered Concentration` / `GAS:Methane`)",
         icon="ℹ️",
     )
 
-    # Visa ett pedagogiskt flödesschema i sidopanelen
     with st.expander("ℹ️ Om GASTRAQ-modellen"):
         st.markdown(
             """
@@ -343,11 +342,8 @@ else:
 
             ### Brusfilter
 
-            Bakgrundsgränsen är höjdberoende:
-            ```
-            Background_Limit = ALT:Altitude × 18.0
-            ```
-            Endast mätningar som överstiger denna gräns klassas som hotspots.
+            Bakgrundsgränsen ställs in manuellt via sidomenyn (standard: 150 ppm*m).
+            Endast mätningar som överstiger denna gräns (Netto > 0) klassas som hotspots och renderas i kartan.
 
             ### Datakällor
             - DJI M350 RTK med TDLAS-metansensor
