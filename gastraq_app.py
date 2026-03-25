@@ -1,14 +1,8 @@
 """
-GASTRAQ – Kvantifiering av metangasutsläpp från drönarmätningar
-================================================================
-Applikation byggd i Streamlit för analys av TDLAS-mätdata från
-DJI M350 med UgCS Skyhub-loggning.
-
-Krav:
-    pip install streamlit pandas numpy
-
-Kör appen:
-    streamlit run app.py
+GASTRAQ – Kvantifiering av metangasutsläpp från drönarmätningar (Yt-Extrapolering)
+==================================================================================
+Applikation byggd i Streamlit för analys av TDLAS-mätdata från DJI M350.
+Krav: pip install streamlit pandas numpy
 """
 
 import streamlit as st
@@ -25,329 +19,184 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEG 1: SIDOPANEL – GASTRAQ VINDMODELLSINSTÄLLNINGAR
+# STEG 1: SIDOPANEL – INSTÄLLNINGAR
 # ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     
-    st.title("⚙️ GASTRAQ-inställningar")
-    st.markdown("**Vindmodell (log-lag profil)**")
+    st.title("⚙️ Inställningar")
+    
+    st.markdown("**1. Yt-extrapolering (Totalutsläpp)**")
+    total_area = st.number_input(
+        label="Deponins totala area (m²)",
+        min_value=100,
+        max_value=1000000,
+        value=50000,
+        step=1000,
+        help="Används för att multiplicera det flugna medelutsläppet till ett totalutsläpp för hela anläggningen.",
+    )
 
-    # Vindhastighet vid referenshöjden
+    st.markdown("**2. Vindmodell (GASTRAQ)**")
     v_ref = st.number_input(
         label="Vindhastighet vid marken (m/s)",
-        min_value=0.1,
-        max_value=30.0,
-        value=3.0,
-        step=0.1,
-        help="Uppmätt vindhastighet på referenshöjden z_ref.",
+        min_value=0.1, max_value=30.0, value=3.0, step=0.1,
     )
-
-    # Referenshöjd för vindmätaren
     z_ref = st.number_input(
         label="Markmätarens höjd (m)",
-        min_value=0.5,
-        max_value=20.0,
-        value=2.0,
-        step=0.5,
-        help="Höjden ovan mark där v_ref är uppmätt.",
+        min_value=0.5, max_value=20.0, value=2.0, step=0.5,
     )
-
-    # Terrängfaktor (Hellman-exponent / alpha)
     alpha = st.number_input(
         label="Terrängfaktor (Alpha)",
-        min_value=0.01,
-        max_value=1.0,
-        value=0.15,
-        step=0.01,
-        help="Hellman-exponenten: 0.10 = hav, 0.15 = öppen mark, 0.25 = förort.",
+        min_value=0.01, max_value=1.0, value=0.15, step=0.01,
     )
     
-    st.markdown("**Brusfilter**")
-    
-    # NYTT: Bakgrundsavdrag för 40Hz-sensorn
+    st.markdown("**3. Trestegs-sköld (Brusfilter)**")
     bg_deduction = st.number_input(
-        label="Bakgrundsavdrag (ppm*m)",
-        min_value=0.0,
-        max_value=1000.0,
-        value=150.0,
-        step=10.0,
-        help="Dras av från all gasdata för att få bort sensorns naturliga brus och den globala bakgrunden.",
+        label="1. Bakgrundsavdrag (ppm*m)",
+        min_value=0.0, max_value=1000.0, value=150.0, step=10.0,
+        help="Golvet: Dras av från all gasdata för att få bort sensorns naturliga brus.",
     )
-
-    st.divider()
-    st.caption(
-        "Modell: v(z) = v_ref × (z / z_ref)^α\n\n"
-        "Källa: GASTRAQ massbalansmetodik (Rees et al.)"
+    min_measurements = st.number_input(
+        label="2. Minsta mätningar per ruta",
+        min_value=1, max_value=20, value=3, step=1,
+        help="Anomalifiltret: Raderar 'laserspikar'. En ruta måste ha så här många mätpunkter för att räknas med.",
+    )
+    max_valid_gas = st.number_input(
+        label="3. Maxvärde / Vattentak (ppm*m)",
+        min_value=1000.0, max_value=100000.0, value=20000.0, step=1000.0,
+        help="Taket: Värden över detta raderas helt. Filtrerar bort optiska reflektioner från vattenbryn och plåttak.",
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STEG 2: HUVUDYTA & FILUPPLADDNING
 # ──────────────────────────────────────────────────────────────────────────────
-st.title("🛸 GASTRAQ – Metangaskvantifiering")
+st.title("🛸 GASTRAQ – Ytkartering & Totalutsläpp")
 st.markdown(
-    "Ladda upp en **UgCS Skyhub CSV-logg** från DJI M350 med TDLAS-metansensor. "
-    "Appen beräknar utsläppsflöden per 1×1 m-ruta med GASTRAQ-massbalansmodellen."
+    "Ladda upp loggfil för att automatiskt bygga rutnät, sortera bort brus (vatten/spikar) "
+    "och extrapolera fram anläggningens sanna totalutsläpp baserat på drönarens medelvärde."
 )
 
-uploaded_file = st.file_uploader(
-    label="📂 Välj en CSV-loggfil",
-    type=["csv"],
-    help="Exporterad loggfil från UgCS Skyhub (DJI M350 + TDLAS).",
-)
-
+uploaded_file = st.file_uploader("📂 Välj en CSV-loggfil", type=["csv"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HJÄLPFUNKTION: Databearbetningsmotor
+# MOTORN
 # ──────────────────────────────────────────────────────────────────────────────
-def bearbeta_data(fil, v_ref: float, z_ref: float, alpha: float, bg_deduction: float):
-    """
-    Läser, rensar och bearbetar en UgCS Skyhub-loggfil.
-
-    Returnerar:
-        df_raw   – Rå DataFrame direkt efter inläsning (för statistik)
-        grid_df  – Aggregerat rutnät redo för visualisering
-        gas_kol  – Namnet på den gaskolumn som valdes
-    """
-
-    # ── 3.1 Läs in filen ──────────────────────────────────────────────────
+def bearbeta_data(fil, v_ref, z_ref, alpha, bg_deduction, min_measurements, max_valid_gas):
     df = pd.read_csv(fil, low_memory=False)
-
-    # Spara antal råpunkter för later statistik
     antal_radpunkter = len(df)
 
-    # ── 3.2 Koordinathantering ────────────────────────────────────────────
-    # Prioritera RTK-GPS; fall tillbaka på vanlig GPS vid NaN
+    # 1. Koordinater & Höjd
     df["Lat"] = pd.to_numeric(df.get("Latitude RTK"), errors="coerce")
     df["Lon"] = pd.to_numeric(df.get("Longitude RTK"), errors="coerce")
-
-    # Fyll RTK-luckor med vanlig GPS
     if "Latitude" in df.columns:
         df["Lat"] = df["Lat"].fillna(pd.to_numeric(df["Latitude"], errors="coerce"))
     if "Longitude" in df.columns:
         df["Lon"] = df["Lon"].fillna(pd.to_numeric(df["Longitude"], errors="coerce"))
+    df["ALT:Altitude"] = pd.to_numeric(df.get("ALT:Altitude", np.nan), errors="coerce").ffill()
 
-    # Forward-filla höjd (radarmätaren loggar glesare än gassen)
-    if "ALT:Altitude" in df.columns:
-        df["ALT:Altitude"] = pd.to_numeric(df["ALT:Altitude"], errors="coerce").ffill()
-    else:
-        raise ValueError("Kolumnen 'ALT:Altitude' saknas i loggfilen.")
-
-    # ── 3.3 Smart kolumnväljare för gaskoncentration ───────────────────────
-    # NYTT: Prioriterar Filtrerad/Leak-data före Fast-data för att undvika falska 40Hz-spikar
+    # 2. Välj Gaskolumn (Prioriterar Leak/Filtered över Fast för maximal stabilitet)
     gas_prioritet = ["GAS:Leak Concentration", "GAS:Filtered Concentration", "GAS:Methane", "GAS:Fast Concentration"]
-    gas_kol = None
-    for kandidat in gas_prioritet:
-        if kandidat in df.columns:
-            gas_kol = kandidat
-            break
+    gas_kol = next((k for k in gas_prioritet if k in df.columns), None)
+    if not gas_kol:
+        raise ValueError("Hittade ingen känd gaskolumn i filen.")
 
-    if gas_kol is None:
-        raise ValueError(
-            f"Ingen gaskolumn hittades. Sökte efter: {gas_prioritet}. "
-            "Kontrollera att rätt loggfil laddats upp."
-        )
-
+    # 3. Interpolera och rensa NaNs
     df["Gas_Raw"] = pd.to_numeric(df[gas_kol], errors="coerce")
-
-    # ── 3.4 Tidsinterpolering (40 Hz → inga luckor) ───────────────────────
     df["Gas_Interpolated"] = df["Gas_Raw"].interpolate(method="linear")
+    df = df.dropna(subset=["Gas_Interpolated", "Lat", "Lon"]).copy()
 
-    # Ta bort rader som ändå saknar gas, lat eller lon
-    df = df.dropna(subset=["Gas_Interpolated", "Lat", "Lon"])
+    # 4. FILTER TAKET: Ta bort extrema optiska reflektioner (vatten/plåt)
+    df = df[df["Gas_Interpolated"] <= max_valid_gas].copy()
 
-    # ── 3.5 & 3.6 Dynamiskt brusfilter och Nettogas ───────────────────────
-    # NYTT: Subtrahera bakgrundsavdraget (t.ex. 150 ppm*m) som kunden ställer in
+    # 5. FILTER GOLVET: Bakgrundsavdrag
     df["Net_Gas_ppmm"] = df["Gas_Interpolated"] - bg_deduction
+    df.loc[df["Net_Gas_ppmm"] < 0, "Net_Gas_ppmm"] = 0 # Nollställ alla negativa värden
+
+    # 6. Bygg spatialt rutnät (AV ALL FLYGD DATA, INKLUSIVE NOLLOR FÖR SANT MEDELVÄRDE)
+    df["latitude"] = df["Lat"].round(5)
+    df["longitude"] = df["Lon"].round(5)
     
-    # Sätt alla negativa värden till 0 (allt under bakgrundsbruset ignoreras)
-    df.loc[df["Net_Gas_ppmm"] < 0, "Net_Gas_ppmm"] = 0
-    
-    # Behåll BARA de rader som faktiskt har ett utsläpp över noll
-    df_hotspots = df[df["Net_Gas_ppmm"] > 0].copy()
-
-    if df_hotspots.empty:
-        raise ValueError(
-            f"Inga hotspots detekterades efter bakgrundsavdraget på {bg_deduction} ppm*m. "
-            "Filen kan visa på en läckagefri flygning, eller så behöver avdraget sänkas."
-        )
-
-    # ── 3.7 Spatialt rutnät (1×1 m approximation via 5 decimaler) ────────
-    df_hotspots["latitude"] = df_hotspots["Lat"].round(5)
-    df_hotspots["longitude"] = df_hotspots["Lon"].round(5)
-
-    # Aggregera per ruta
-    grid_df = (
-        df_hotspots.groupby(["latitude", "longitude"])
-        .agg(
-            Net_Gas_ppmm=("Net_Gas_ppmm", "mean"),
-            ALT_Altitude=("ALT:Altitude", "mean"),
-            Antal_Mätningar=("Net_Gas_ppmm", "count"),
-        )
-        .reset_index()
-    )
-
-    # Byt tillbaka kolumnnamnet för tydlighet
+    grid_df = df.groupby(["latitude", "longitude"]).agg(
+        Net_Gas_ppmm=("Net_Gas_ppmm", "mean"),
+        ALT_Altitude=("ALT:Altitude", "mean"),
+        Antal_Mätningar=("Net_Gas_ppmm", "count"),
+    ).reset_index()
     grid_df = grid_df.rename(columns={"ALT_Altitude": "ALT:Altitude"})
 
-    # ── 3.8 Massbalans – GASTRAQ-modellen ────────────────────────────────
-    # Beräkna vindhastighet på drönarhöjden med log-lag-profil
+    # 7. FILTER ANOMALIER: Rensa bort spöksignaler (rutor med för få mätningar)
+    grid_df = grid_df[grid_df["Antal_Mätningar"] >= min_measurements].copy()
+    
+    # Spara hur stor yta vi faktiskt flög över och fick godkänd data ifrån
+    flugen_yta_m2 = len(grid_df)
+
+    # 8. Massbalans (g/h per kvadratmeter) via GASTRAQ
     grid_df["Wind_m_s"] = v_ref * ((grid_df["ALT:Altitude"] / z_ref) ** alpha)
-
-    # Omvandla ppm·m till g/m² (metan: densitet ≈ 0.000667 g/ppm·m vid STP)
     grid_df["Mass_g_m2"] = grid_df["Net_Gas_ppmm"] * 0.000667
+    grid_df["Flux_g_h"] = grid_df["Mass_g_m2"] * grid_df["Wind_m_s"] * 3600
 
-    # Massflöde per sekund (massa × vindhastighet × 1 m bredd)
-    grid_df["Flux_g_s"] = grid_df["Mass_g_m2"] * grid_df["Wind_m_s"] * 1.0
+    # 9. Räkna ut det sanna medelvärdet för hela den flugna ytan
+    medelutslapp_per_m2 = grid_df["Flux_g_h"].mean() if not grid_df.empty else 0
 
-    # Massflöde per timme
-    grid_df["Flux_g_h"] = grid_df["Flux_g_s"] * 3600
+    # 10. SKAPA HOTSPOT-KARTAN (Filtrera bort nollorna enbart för tabell och karta)
+    hotspot_df = grid_df[grid_df["Net_Gas_ppmm"] > 0].sort_values("Flux_g_h", ascending=False).reset_index(drop=True)
 
-    # ── 3.9 Sortera på värsta flöde ───────────────────────────────────────
-    grid_df = grid_df.sort_values("Flux_g_h", ascending=False).reset_index(drop=True)
-
-    return antal_radpunkter, grid_df, gas_kol
+    return antal_radpunkter, hotspot_df, gas_kol, flugen_yta_m2, medelutslapp_per_m2
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEG 3 + 4: TRIGGA BEARBETNING & VISA RESULTAT
+# KÖRNING & RESULTAT
 # ──────────────────────────────────────────────────────────────────────────────
 if uploaded_file is not None:
-    with st.spinner("⏳ Bearbetar loggdata – interpolerar sensorer och beräknar flöden…"):
+    with st.spinner("⏳ Bearbetar data, bygger rutnät och extrapolerar ytor..."):
         try:
-            # NYTT: Lägg till bg_deduction i funktionsanropet
-            antal_radpunkter, grid_df, gas_kol = bearbeta_data(
-                uploaded_file, v_ref, z_ref, alpha, bg_deduction
+            antal_radpunkter, hotspot_df, gas_kol, flugen_yta_m2, medelutslapp_per_m2 = bearbeta_data(
+                uploaded_file, v_ref, z_ref, alpha, bg_deduction, min_measurements, max_valid_gas
             )
-        except ValueError as e:
-            st.error(f"❌ Fel vid bearbetning: {e}")
-            st.stop()
         except Exception as e:
-            st.error(f"❌ Oväntat fel: {e}")
+            st.error(f"❌ Fel vid databearbetning: {e}")
             st.stop()
 
-    st.success(f"✅ Klar! Gaskolumn som användes: **{gas_kol}**")
+    # --- KPI: TOTALUTSLÄPP ---
+    estimerad_total_kgh = (medelutslapp_per_m2 * total_area) / 1000
+    
+    st.success(f"✅ Beräkning klar! Använde gaskolumn: **{gas_kol}**")
+    
+    st.info(f"""
+    ### 🌍 Estimerat Totalutsläpp: {estimerad_total_kgh:,.1f} kg/h
+    **Uträkning:** Drönaren flög över **{flugen_yta_m2:,} m²** och mätte ett genomsnittligt utsläpp på **{medelutslapp_per_m2:.2f} g/h per m²** över den ytan (inklusive rena ytor). 
+    Detta medelvärde har sedan multiplicerats med anläggningens totala yta (**{total_area:,} m²**) för att ge en uppskattning för hela deponin.
+    """)
 
-    # ── 4.1 Nyckeltal (metric-boxar) ──────────────────────────────────────
+    st.divider()
+
+    # --- KPI: HOTSPOTS ---
     col1, col2, col3 = st.columns(3)
+    col1.metric("🗺️ Läckande 1x1m rutor", f"{len(hotspot_df):,}")
+    värsta = hotspot_df["Flux_g_h"].iloc[0] if not hotspot_df.empty else 0
+    col2.metric("🔥 Värsta Rutan (g/h)", f"{värsta:,.1f}")
+    col3.metric("📊 Processade råpunkter", f"{antal_radpunkter:,}")
 
-    with col1:
-        st.metric(
-            label="🗺️ Unika Hotspots (1×1 m)",
-            value=f"{len(grid_df):,}",
-            help="Antal unika rutor i det spatiala rutnätet med detekterade utsläpp.",
-        )
-    with col2:
-        värsta_flux = grid_df["Flux_g_h"].iloc[0] if not grid_df.empty else 0
-        st.metric(
-            label="🔥 Värsta rutan (g/h)",
-            value=f"{värsta_flux:,.1f}",
-            help="Högsta beräknade massflöde i en enskild 1×1 m-ruta.",
-        )
-    with col3:
-        st.metric(
-            label="📊 Råpunkter totalt",
-            value=f"{antal_radpunkter:,}",
-            help="Totalt antal datarader i originalfilen (inkl. NaN).",
-        )
+    # --- KARTA ---
+    st.subheader("📍 Karta över detekterade Hotspots")
+    if not hotspot_df.empty:
+        # Gör punktstorleken dynamisk så stora läckor syns tydligare
+        hotspot_df["Punktstorlek"] = (hotspot_df["Flux_g_h"] / 100) + 5
+        st.map(hotspot_df, latitude="latitude", longitude="longitude", size="Punktstorlek", color="#ff0000", zoom=17)
+    else:
+        st.success("Inga hotspots hittades! Ytan är helt ren från läckage utifrån valda brusfilter.")
 
-    st.divider()
-
-    # ── 4.2 Karta ─────────────────────────────────────────────────────────
-    st.subheader("🗺️ Karta över Hotspots")
-    st.caption(
-        "Varje punkt representerar en 1×1 m-ruta med detekterat metanutsläpp. "
-        "Zoomfunktion och panorering stöds i kartan."
-    )
-
-    st.map(grid_df[["latitude", "longitude"]], zoom=17, use_container_width=True)
-
-    st.divider()
-
-    # ── 4.3 Topplista (DataFrame) ──────────────────────────────────────────
-    st.subheader("📋 Topplista – Värsta 1×1 m-rutorna")
-    st.caption("Sorterat efter beräknat massflöde (g/h), fallande.")
-
-    visnings_df = grid_df[
-        [
-            "latitude",
-            "longitude",
-            "Flux_g_h",
-            "Net_Gas_ppmm",
-            "ALT:Altitude",
-            "Wind_m_s",
-            "Antal_Mätningar",
-        ]
-    ].copy()
-
-    visnings_df = visnings_df.round(
-        {
-            "latitude": 5,
-            "longitude": 5,
-            "Flux_g_h": 1,
-            "Net_Gas_ppmm": 2,
-            "ALT:Altitude": 1,
-            "Wind_m_s": 2,
-        }
-    )
-
-    visnings_df.columns = [
-        "Latitud",
-        "Longitud",
-        "Flöde (g/h)",
-        "Nettogas (ppm·m)",
-        "Höjd (m)",
-        "Vind (m/s)",
-        "Antal mätningar",
-    ]
-
-    st.dataframe(
-        visnings_df,
-        use_container_width=True,
-        height=420,
-    )
-
-    csv_export = grid_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="⬇️ Ladda ner rutnät som CSV",
-        data=csv_export,
-        file_name="gastraq_resultat.csv",
-        mime="text/csv",
-    )
-
+    # --- TOPPLISTA ---
+    st.subheader("📋 Topplista – Värsta rutorna")
+    if not hotspot_df.empty:
+        visnings_df = hotspot_df[["latitude", "longitude", "Flux_g_h", "Net_Gas_ppmm", "ALT:Altitude", "Wind_m_s", "Antal_Mätningar"]].copy()
+        visnings_df = visnings_df.round({
+            "latitude": 5, "longitude": 5, "Flux_g_h": 1, "Net_Gas_ppmm": 1, "ALT:Altitude": 1, "Wind_m_s": 2
+        })
+        visnings_df.columns = ["Latitud", "Longitud", "Flöde (g/h)", "Nettogas (ppm·m)", "Höjd (m)", "Vind (m/s)", "Antal mätningar"]
+        
+        st.dataframe(visnings_df, use_container_width=True, height=400)
+        
+        csv_export = hotspot_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Ladda ner hotspots som CSV", data=csv_export, file_name="gastraq_hotspots.csv", mime="text/csv")
 else:
-    st.info(
-        "👆 Ladda upp en UgCS Skyhub-loggfil i CSV-format för att starta analysen.\n\n"
-        "**Förväntade kolumner:**\n"
-        "- `Latitude RTK` / `Longitude RTK` (eller `Latitude` / `Longitude`)\n"
-        "- `ALT:Altitude`\n"
-        "- `GAS:Leak Concentration` (eller `GAS:Filtered Concentration` / `GAS:Methane`)",
-        icon="ℹ️",
-    )
-
-    with st.expander("ℹ️ Om GASTRAQ-modellen"):
-        st.markdown(
-            """
-            ### Massbalansmetodik
-
-            GASTRAQ-modellen beräknar metanflöde per ytenhet med formeln:
-
-            ```
-            v(z) = v_ref × (z / z_ref)^α          [Hellmans vindprofil]
-            Mass  = Net_Gas_ppmm × 0.000667        [g/m²]
-            Flux  = Mass × v(z) × 1.0              [g/s per m-bredd]
-            ```
-
-            Parametrarna `v_ref`, `z_ref` och `α` ställs in i sidopanelen.
-
-            ### Brusfilter
-
-            Bakgrundsgränsen ställs in manuellt via sidomenyn (standard: 150 ppm*m).
-            Endast mätningar som överstiger denna gräns (Netto > 0) klassas som hotspots och renderas i kartan.
-
-            ### Datakällor
-            - DJI M350 RTK med TDLAS-metansensor
-            - Loggning via UgCS Skyhub (upp till 40 Hz)
-            - RTK-GPS med cm-noggrannhet
-            """
-        )
+    st.info("👆 Ladda upp din UgCS Skyhub CSV-fil för att starta analysen.")
